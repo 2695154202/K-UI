@@ -468,6 +468,9 @@ async function parseThirdPartySubscription(content) {
 let schemaReadyPromise = null;
 let lastReceiptCleanup = 0;
 
+// schema 结构版本号：未来修改表结构时递增此值，触发一次性迁移重新执行
+const SCHEMA_VERSION = 2;
+
 function loginThrottleKey(request) { return `${request.headers.get('CF-Connecting-IP') || 'unknown'}:${String(request.headers.get('Authorization') || '').split('.')[0].slice(0, 128)}`; }
 
 async function loginAllowed(db, request) {
@@ -576,7 +579,21 @@ async function initializeDbSchema(db) {
 
 async function ensureDbSchema(db) {
     if (!schemaReadyPromise) {
-        schemaReadyPromise = initializeDbSchema(db).catch(error => {
+        // 版本化一次性迁移：schema 已就绪时每个隔离实例只做 1 条查询，
+        // 避免在 D1（单线程串行）上反复执行 ~35 条 DDL 导致 20s+ 排队超时。
+        schemaReadyPromise = (async () => {
+            let version = null;
+            try {
+                const flag = await db.prepare("SELECT val FROM sys_config WHERE key = 'schema_ready'").first();
+                version = flag ? flag.val : null;
+            } catch (error) { version = null; }
+            if (version !== String(SCHEMA_VERSION)) {
+                await initializeDbSchema(db);
+                try {
+                    await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('schema_ready', ?, ?)").bind(String(SCHEMA_VERSION), Date.now()).run();
+                } catch (error) {}
+            }
+        })().catch(error => {
             schemaReadyPromise = null;
             throw error;
         });
